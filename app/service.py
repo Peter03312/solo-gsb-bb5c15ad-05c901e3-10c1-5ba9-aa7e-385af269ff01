@@ -13,12 +13,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
-from .models import Batch, BatchReview, IdempotencyKey, Production, ProductionInput
+from .models import (
+    Batch,
+    BatchReview,
+    BatchSplit,
+    IdempotencyKey,
+    Production,
+    ProductionInput,
+)
 from .schemas import (
     CancelIn,
     ProductionIn,
     RawBatchIn,
     ReviewIn,
+    SplitIn,
     SuspectIn,
 )
 
@@ -291,6 +299,107 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     ).scalar_one()
 
 
+# ---------------------------------------------------------------- 批次分装
+
+
+def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, Any]:
+    """把同一批次分装为多个可独立投料的子批次。
+
+    一笔分装包含多个互异的新编号及各自正数分装量。全部校验通过后才在同一
+    事务内扣减父批次余量、创建子批次（继承单位，初始/当前余量等于分装量）
+    并写分装关系；分装不产生生产单，任一不符整笔拒绝、不改库存。
+
+    校验顺序：
+    1. 同一笔分装中新编号互不相同；
+    2. 父批次存在（SOURCE_NOT_FOUND 404）、未隔离（BATCH_QUARANTINED 409）、
+       非已撤销产出（BATCH_CANCELLED 409）；
+    3. 每个新编号未被占用（BATCH_NO_REUSED 409，编号全局不得复用）；
+    4. 分装总量为正（入参已逐项保证 > 0）且不超过父批次余量
+       （INSUFFICIENT_BALANCE 409）。
+
+    并发：与生产提交相同，按编号升序持锁（此处只锁父批次），子批次行由
+    唯一约束兜底并发抢号；SQLite 由 BEGIN IMMEDIATE 全库串行。分装 / 投料
+    并发不会超用；与污染标记/复核的关系同生产事务（经行锁与 QC 表锁互斥），
+    隔离沿分装边与投料边一并传播，不会漏隔离。
+    """
+    child_nos = [item.batch_no for item in data.splits]
+    if len(set(child_nos)) != len(child_nos):
+        dup = next(no for no in child_nos if child_nos.count(no) > 1)
+        raise errors.duplicate_split_target(dup)
+
+    parent = _lock_batch(session, parent_no)
+    if parent is None:
+        raise errors.batch_not_found(parent_no)
+    if _is_cancelled_output(session, parent_no):
+        raise errors.batch_cancelled(parent_no)
+    if parent.is_quarantined:
+        raise errors.batch_quarantined(parent_no)
+
+    # 新编号不得复用：编号空间全局唯一（原料/产出/子批次共用）
+    existing_nos = {
+        r[0]
+        for r in session.execute(
+            select(Batch.batch_no).where(Batch.batch_no.in_(child_nos))
+        ).all()
+    }
+    if existing_nos:
+        raise errors.batch_exists(sorted(existing_nos)[0])
+
+    total = Decimal("0")
+    for item in data.splits:
+        total += item.quantity
+    if total > parent.remaining_qty:
+        raise errors.insufficient(parent_no, total, parent.remaining_qty)
+
+    created: list[Batch] = []
+    relations: list[BatchSplit] = []
+    for item in data.splits:
+        child = Batch(
+            batch_no=item.batch_no,
+            unit=parent.unit,
+            initial_qty=item.quantity,
+            remaining_qty=item.quantity,
+        )
+        session.add(child)
+        try:
+            session.flush()  # 尽早暴露并发下的编号冲突
+        except IntegrityError:
+            raise errors.batch_exists(item.batch_no) from None
+        created.append(child)
+        relations.append(
+            BatchSplit(parent_no=parent_no, child_no=item.batch_no, qty=item.quantity)
+        )
+
+    for item in data.splits:
+        parent.remaining_qty -= item.quantity
+    session.add_all(relations)
+    session.flush()
+
+    return {
+        "parent_batch_no": parent_no,
+        "parent_remaining_qty": float(parent.remaining_qty),
+        "splits": [
+            {
+                "batch_no": child.batch_no,
+                "unit": child.unit,
+                "quantity": float(child.initial_qty),
+                "remaining_qty": float(child.remaining_qty),
+                "is_suspect": child.is_suspect,
+                "is_quarantined": child.is_quarantined,
+            }
+            for child in created
+        ],
+        "relations": [
+            {
+                "parent_batch_no": parent_no,
+                "child_batch_no": child.batch_no,
+                "quantity": float(child.initial_qty),
+            }
+            for child in created
+        ],
+    }
+
+
 # ---------------------------------------------------------------- 生产单撤销
 
 
@@ -330,6 +439,7 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     1. 产出编号存在且确为生产产出（原料批次不可撤销）；
     2. 该生产单尚未撤销（重复撤销明确拒绝）；
     3. 产出从未被后续生产投料（严格按保留的投料记录判定，与下游是否已撤销无关）；
+    3b. 产出从未被分装（一旦分装即视为曾被使用，即使子批次尚未投料）；
     4. 产出当前非疑似（自身 is_suspect 为假；仅因疑似祖先被连带隔离不阻止撤销）；
     5. 产出无质检复核记录。
 
@@ -372,6 +482,15 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     consumer_nos = sorted({row[0] for row in consumer_rows})
     if consumer_nos:
         raise errors.output_already_consumed(output_no, consumer_nos)
+
+    # 产出一旦被分装（即使子批次尚未投料）即视为曾被使用，拒绝撤销：
+    # 分装边已进入谱系/隔离传播，撤销生产单会令来源返还与父子关系自相矛盾。
+    split_rows = session.execute(
+        select(BatchSplit.child_no).where(BatchSplit.parent_no == output_no)
+    ).all()
+    child_nos = sorted({row[0] for row in split_rows})
+    if child_nos:
+        raise errors.output_already_split(output_no, child_nos)
 
     # 产出当前非疑似（仅因疑似祖先被隔离不阻止撤销）
     if output_batch.is_suspect:
@@ -434,33 +553,51 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
 
 # ---------------------------------------------------------------- 谱系与污染
 
-# 边方向：source -> output（原料指向产出）
+# 边方向：parent -> child（父批次指向子批次），谱系由两类边共同构成：
+# - PRODUCTION：source -> output（生产投料边）
+# - SPLIT：父批次 -> 子批次（分装边，子批次可独立投料）
 # 已撤销生产单的投料边不再进入有效谱系查询，也不参与疑似隔离传播：
 # 撤销后产出作废、来源投料已在同一事务返还，该笔单据视为从未发生。
+# 分装边不撤销（撤销只针对生产单据），始终参与谱系遍历与隔离传播。
 _EDGE_CTE = """
-SELECT pi.source_no AS parent_no, p.output_no AS child_no
+SELECT pi.source_no AS parent_no, p.output_no AS child_no, 'PRODUCTION' AS kind
 FROM production_inputs pi
 JOIN productions p ON p.id = pi.production_id
 WHERE p.is_cancelled = FALSE
+UNION ALL
+SELECT bs.parent_no, bs.child_no, 'SPLIT'
+FROM batch_splits bs
 """
 
 
 def _descendant_rows(session: Session, batch_no: str) -> list[dict[str, Any]]:
-    """递归求全部后代（直接/间接使用该批次的产出），带层数。"""
+    """递归求全部后代（直接/间接使用该批次的产出/子批次），带层数。
+
+    谱系是允许汇聚的 DAG（混料、分装都可能使同一后代经多条路径到达），
+    递归按 (batch_no, depth) 去重，最终每个批次只保留最小深度，并按
+    (depth, batch_no) 稳定排序。
+    """
     sql = f"""
-    WITH RECURSIVE walk(batch_no, depth, path) AS (
-        SELECT :root, 0, :root
+    WITH RECURSIVE walk(batch_no, depth) AS (
+        SELECT :root, 0
         UNION
-        SELECT e.child_no, w.depth + 1, w.path || '>' || e.child_no
+        SELECT e.child_no, w.depth + 1
         FROM walk w JOIN ({_EDGE_CTE}) e ON e.parent_no = w.batch_no
     )
-    SELECT batch_no, depth FROM walk WHERE depth > 0 ORDER BY depth, batch_no
+    SELECT batch_no, MIN(depth) AS depth
+    FROM walk
+    WHERE depth > 0
+    GROUP BY batch_no
+    ORDER BY depth, batch_no
     """
     return [dict(r._mapping) for r in session.execute(text(sql), {"root": batch_no})]
 
 
 def _ancestor_rows(session: Session, batch_no: str) -> list[dict[str, Any]]:
-    """递归求全部祖先（直接/间接被其消耗的原料），带层数。"""
+    """递归求全部祖先（直接/间接被其消耗的原料/父批次），带层数。
+
+    同一祖先可能经投料边与分装边多条路径到达，按批次取最小深度去重。
+    """
     sql = f"""
     WITH RECURSIVE walk(batch_no, depth) AS (
         SELECT :root, 0
@@ -468,7 +605,11 @@ def _ancestor_rows(session: Session, batch_no: str) -> list[dict[str, Any]]:
         SELECT e.parent_no, w.depth + 1
         FROM walk w JOIN ({_EDGE_CTE}) e ON e.child_no = w.batch_no
     )
-    SELECT batch_no, depth FROM walk WHERE depth > 0 ORDER BY depth, batch_no
+    SELECT batch_no, MIN(depth) AS depth
+    FROM walk
+    WHERE depth > 0
+    GROUP BY batch_no
+    ORDER BY depth, batch_no
     """
     return [dict(r._mapping) for r in session.execute(text(sql), {"root": batch_no})]
 
@@ -570,12 +711,25 @@ def lineage(session: Session, batch_no: str) -> dict[str, Any]:
             Production.is_cancelled.is_(False),
         )
     ).all()
+    edge_list = [
+        {"from": s, "to": o, "kind": "PRODUCTION"} for s, o in edges
+    ]
+    # 分装边与投料边一起进入谱系
+    split_edges = session.execute(
+        select(BatchSplit.parent_no, BatchSplit.child_no).where(
+            BatchSplit.parent_no.in_(involved),
+            BatchSplit.child_no.in_(involved),
+        )
+    ).all()
+    edge_list.extend(
+        {"from": p, "to": c, "kind": "SPLIT"} for p, c in split_edges
+    )
     return {
         "batch_no": batch_no,
         "is_cancelled": _is_cancelled_output(session, batch_no),
         "upstream": upstream,
         "downstream": downstream,
-        "edges": [{"from": s, "to": o} for s, o in edges],
+        "edges": edge_list,
     }
 
 

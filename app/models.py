@@ -113,6 +113,38 @@ class ProductionInput(Base):
     )
 
 
+class BatchSplit(Base):
+    """批次分装关系：父批次 -> 一个可独立投料的子批次。
+
+    分装只拆分余量、不产生生产单：父批次余量按 qty 扣减，子批次继承父批次
+    单位、初始/当前余量均为 qty。子批次与普通批次一样可作为生产来源，也可
+    再次分装。分装关系与投料关系一样进入谱系遍历与疑似隔离传播。
+    """
+
+    __tablename__ = "batch_splits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    # 一个子批次只能由一次分装创建（批次编号全局唯一、不得复用）
+    child_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False, unique=True
+    )
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    parent: Mapped[Batch] = relationship(foreign_keys=[parent_no])
+    child: Mapped[Batch] = relationship(foreign_keys=[child_no])
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_batch_split_qty_positive"),
+        Index("ix_batch_split_parent", "parent_no"),
+    )
+
+
 class BatchReview(Base):
     """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
 

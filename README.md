@@ -1,7 +1,8 @@
 # 批次追溯服务（batch-trace）
 
 面向小型食品加工厂的**本地批次追溯服务**：登记原料批次、记录生产投料与产出、
-查询批次余量与上下游谱系，并在发现疑似污染批次时找出并隔离全部后代产出。
+把批次分装为可独立投料的子批次、查询批次余量与上下游谱系，并在发现疑似污染
+批次时沿投料与分装关系找出并隔离全部后代产出。
 
 - 语言/框架：Python 3.12 + FastAPI + SQLAlchemy 2
 - 关系数据库：PostgreSQL 16（Docker Compose 一键启动）；无数据库时自动回退本地 SQLite 文件库
@@ -78,6 +79,7 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | GET | `/health` | 健康检查 |
 | POST | `/raw-batches` | 登记一个原料批次及初始数量 |
 | POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次 |
+| POST | `/batches/{batch_no}/splits` | 批次分装：一个父批次 → 多个可独立投料的子批次 |
 | POST | `/productions/{output_no}/cancellation` | 撤销录入错误的生产单：返还来源投料、作废产出与投料边 |
 | GET | `/productions/{output_no}` | 按产出编号查询生产原单据（含撤销状态/原因） |
 | GET | `/batches/{batch_no}` | 查询批次余量与状态 |
@@ -127,6 +129,34 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 10. 撤销并发：撤销与污染标记/复核一样先取 QC 串行化锁，再按编号升序锁定
     “产出 + 各来源”，使撤销 / 投料 / 污染标记 / 复核任意并发都等价于某一串行
     顺序，不会超用余量或误放行（例如“撤销成功且该产出又被投料”不会发生）。
+11. 批次分装（split）：同一原料或产出批次可按**父批次编号**
+    `POST /batches/{batch_no}/splits`，一笔提交**多个互异新编号**及各自**正数
+    分装量**，服务返回**父批次新余量、子批次清单与分装关系**。
+    - 子批次**继承父批次单位**，其初始/当前余量等于分装量；**分装不产生
+      生产单**（子批次查不到生产原单据），但子批次与普通批次一样**可作为
+      正常生产来源**投料，也可再次分装；
+    - 校验：父批次须**存在**（`SOURCE_NOT_FOUND` 404）、**未隔离**
+      （`BATCH_QUARANTINED` 409）且**非已撤销产出**（`BATCH_CANCELLED` 409）；
+      同一笔分装内新编号必须**互异**（`DUPLICATE_SPLIT_TARGET` 422）；
+      新编号全局**不得复用**（`BATCH_NO_REUSED` 409）；分装总量必须为正且
+      **不得超过父批次余量**（`INSUFFICIENT_BALANCE` 409，details 中
+      `requested` 为分装总量）。任一不符**整笔拒绝、不改任何库存**，
+      已扣减到一半也会随事务回滚；
+    - **谱系**：分装边（`kind: "SPLIT"`）与投料边（`kind: "PRODUCTION"`）
+      **一起遍历**，祖先/后代、深度与边集合均同时包含两类关系；同一批次经
+      多条路径（混料 + 分装形成的菱形 DAG）只出现一次，深度取最短路径；
+    - **隔离传播**：祖先被标记疑似或经复核重算后，隔离沿**分装边与投料边
+      两类关系**传播并重算；混料后代仍按“任一疑似来源”隔离。分装新建的
+      子批次初始不隔离；在隔离父批次上提交分装会被整笔拒绝；
+    - **撤销联动**：父批次若为**生产产出**，一旦被分装即**视为曾被使用**
+      ——即使子批次尚未投料，原撤销入口也以 `OUTPUT_ALREADY_SPLIT`(409)
+      拒绝（details 的 `split_into` 列出子批次编号），且不改变任何库存；
+    - **并发**：分装与生产提交共用同一套单事务 + 按编号升序行锁
+      （SQLite 为 `BEGIN IMMEDIATE` 串行化），分装 / 投料并发绝不超用；
+      与污染标记 / 复核经行锁与 QC 表锁互斥，结果等价于某一串行顺序，
+      绝不漏隔离；
+    - 幂等沿用既有 `Idempotency-Key` 规则：同键同体重放返回首次结果、
+      只扣一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，失败不固化可重试。
 
 ### 错误响应格式
 
@@ -136,9 +166,11 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 
 常见错误码：`SOURCE_NOT_FOUND`(404)、`PRODUCTION_NOT_FOUND`(404)、`BATCH_NO_REUSED`(409)、
 `INSUFFICIENT_BALANCE`(409)、`UNIT_MISMATCH`(422)、`OUTPUT_EXCEEDS_INPUT`(422)、
+`DUPLICATE_INPUT`(422)、`DUPLICATE_SPLIT_TARGET`(422)、
 `VALIDATION_ERROR`(422)、`BATCH_QUARANTINED`(409)、`BATCH_NOT_SUSPECT`(409)、
-`OUTPUT_ALREADY_CONSUMED`(409)、`OUTPUT_IS_SUSPECT`(409)、`PRODUCTION_HAS_REVIEW`(409)、
-`PRODUCTION_ALREADY_CANCELLED`(409)、`BATCH_CANCELLED`(409)、`IDEMPOTENCY_CONFLICT`(409)。
+`OUTPUT_ALREADY_CONSUMED`(409)、`OUTPUT_ALREADY_SPLIT`(409)、`OUTPUT_IS_SUSPECT`(409)、
+`PRODUCTION_HAS_REVIEW`(409)、`PRODUCTION_ALREADY_CANCELLED`(409)、`BATCH_CANCELLED`(409)、
+`IDEMPOTENCY_CONFLICT`(409)。
 
 ---
 
@@ -212,13 +244,16 @@ curl http://localhost:8080/batches/RM-A/lineage
      "unit": "kg", "is_suspect": false, "is_quarantined": false}
   ],
   "edges": [
-    {"from": "RM-A", "to": "MIX-1"},
-    {"from": "MIX-1", "to": "FG-1"}
+    {"from": "RM-A", "to": "MIX-1", "kind": "PRODUCTION"},
+    {"from": "MIX-1", "to": "FG-1", "kind": "PRODUCTION"}
   ]
 }
 ```
 
-`depth` 表示与查询批次相隔的生产层数；`edges` 给出当前谱系子图中的“原料 → 产出”有向边。
+`depth` 表示与查询批次相隔的关系层数；`edges` 给出当前谱系子图中的有向边，
+`kind` 为 `PRODUCTION`（投料边：来源 → 产出）或 `SPLIT`（分装边：父批次 →
+子批次），两类关系在谱系与隔离传播中等价遍历。同一批次经多条路径到达时
+（混料/分装形成的菱形 DAG）只出现一次，`depth` 取最短路径。
 
 ### 6. 标记疑似污染并找出全部后代
 
@@ -397,6 +432,89 @@ curl -i -X POST http://localhost:8080/productions/GHOST/cancellation \
 # 422 VALIDATION_ERROR
 ```
 
+### 10. 分装：把同一批次拆成可独立投料的子批次
+
+把原料批次 `RM-1`（100 kg）一次性分装为两个子批次 `RM-1-A`（30 kg）与
+`RM-1-B`（20 kg）：
+
+```bash
+curl -X POST http://localhost:8080/batches/RM-1/splits \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: split-rm1-20261001-01' \
+  -d '{"splits":[
+        {"batch_no":"RM-1-A","quantity":"30"},
+        {"batch_no":"RM-1-B","quantity":"20"}
+      ]}'
+```
+
+```json
+{
+  "parent_batch_no": "RM-1",
+  "parent_remaining_qty": 40.0,
+  "splits": [
+    {"batch_no":"RM-1-A","unit":"kg","quantity":30.0,"remaining_qty":30.0,
+     "is_suspect":false,"is_quarantined":false},
+    {"batch_no":"RM-1-B","unit":"kg","quantity":20.0,"remaining_qty":20.0,
+     "is_suspect":false,"is_quarantined":false}
+  ],
+  "relations": [
+    {"parent_batch_no":"RM-1","child_batch_no":"RM-1-A","quantity":30.0},
+    {"parent_batch_no":"RM-1","child_batch_no":"RM-1-B","quantity":20.0}
+  ]
+}
+```
+
+子批次继承单位、**分装不产生生产单**，但可作为正常生产来源投料，也可再次分装：
+
+```bash
+# 子批次作为正常来源混料投料
+curl -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: prod-mix2-001' \
+  -d '{"output_batch_no":"MIX-2","unit":"kg","output_quantity":25,
+       "inputs":[{"batch_no":"RM-1-A","quantity":20},{"batch_no":"RM-1-B","quantity":5}]}'
+
+# 子批次继续分装
+curl -X POST http://localhost:8080/batches/RM-1-A/splits \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: split-rm1a-001' \
+  -d '{"splits":[{"batch_no":"RM-1-A-1","quantity":"10"}]}'
+```
+
+分装边与投料边一起进入谱系（`kind` 区分两类），疑似隔离沿两类边传播：
+
+```bash
+curl -X POST http://localhost:8080/contamination \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cont-rm1-01' \
+  -d '{"batch_no":"RM-1","note":"抽检农残超标"}'
+# affected_batch_nos 同时包含分装后代（RM-1-A/RM-1-B/RM-1-A-1）与
+# 投料后代（MIX-2）；混料后代仍按“任一疑似来源”整体隔离
+```
+
+任一不符整笔拒绝、不改库存（示例）：
+
+```bash
+# 父批次不存在：404 SOURCE_NOT_FOUND
+# 同一笔分装新编号重复：422 DUPLICATE_SPLIT_TARGET
+# 新编号已被占用（原料/产出/子批次共用编号空间）：409 BATCH_NO_REUSED
+# 分装总量超过父余量（如余量 40 却分装 30+20）：
+#   409 INSUFFICIENT_BALANCE，details.requested 为分装总量 50
+# 父批次已隔离（含疑似）：409 BATCH_QUARANTINED
+# 父批次为已撤销产出：409 BATCH_CANCELLED
+# 分装量为 0/负数或 splits 为空：422 VALIDATION_ERROR
+```
+
+父批次若是生产产出，分装后视为曾被使用——即使子批次尚未投料，撤销入口也拒绝：
+
+```bash
+# MIX-1 是生产产出，曾分装出 MIX-1-A（即便 MIX-1-A 从未投料）
+curl -i -X POST http://localhost:8080/productions/MIX-1/cancellation \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cancel-mix1-01' \
+  -d '{"cancel_reason":"录入错误"}'
+# HTTP/1.1 409
+# {"error":{"code":"OUTPUT_ALREADY_SPLIT",
+#   "details":{"batch_no":"MIX-1","split_into":["MIX-1-A"]}, ...}}
+# 来源余量不返还、生产单不撤销
+```
+
 ---
 
 ## 五、项目结构
@@ -405,14 +523,16 @@ curl -i -X POST http://localhost:8080/productions/GHOST/cancellation \
 app/
   config.py       # 环境变量配置
   db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表与增量补列
-  models.py       # batches / productions(含撤销字段) / production_inputs / batch_reviews / idempotency_keys
-  schemas.py      # Pydantic 请求响应模型（正数、定点数、非空撤销原因校验）
+  models.py       # batches / productions(含撤销字段) / production_inputs /
+                  # batch_splits(分装关系) / batch_reviews / idempotency_keys
+  schemas.py      # Pydantic 请求响应模型（正数、定点数、非空撤销原因、分装校验）
   errors.py       # 业务错误码
-  service.py      # 核心逻辑：登记、生产事务、撤销返还、幂等、递归谱系、污染传播、复核重算
+  service.py      # 核心逻辑：登记、分装、生产事务、撤销返还、幂等、递归谱系
+                  # （投料边+分装边）、污染传播、复核重算
   routes.py       # HTTP 路由
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（57 个用例）
+tests/            # 端到端 + 并发测试（85 个用例，含分装/分装并发）
 Dockerfile
 docker-compose.yml
 ```
@@ -441,10 +561,17 @@ docker-compose.yml
   两个相同撤销并发时恰好一个成功、另一个以 `PRODUCTION_ALREADY_CANCELLED` 拒绝，
   来源余量只返还一次。
 - 幂等记录与业务数据在同一事务内落库，唯一约束 `(method, path, key)` 兜底并发首请求竞争。
+- 分装与生产提交同属余量扣减事务：单事务内按编号升序对父批次加行锁
+  （SQLite 为 `BEGIN IMMEDIATE` 全库写锁），扣减、建子批次、写分装关系原子
+  完成；并发分装 / 并发分装与投料绝不超用，与 QC 事务（标记/复核/撤销）
+  经行锁与表锁互斥，结果等价于某一串行顺序，绝不漏隔离。生产产出一旦存在
+  分装边，撤销校验即以 `OUTPUT_ALREADY_SPLIT` 拒绝，杜绝“撤销成功且分装仍
+  在谱系中传播”的矛盾结局。
 
-> 注：新表 `batch_reviews` 与 `productions` 表的撤销字段（`is_cancelled` /
-> `cancel_reason` / `cancelled_at`）随启动/入口的 `CREATE TABLE IF NOT EXISTS`
-> 与幂等 `ALTER TABLE ... ADD COLUMN` 自动创建/补齐，既有数据库升级无需手工
-> 迁移；现有登记、生产、污染标记、复核、批次/谱系查询接口的请求、响应字段与
-> 启动方式均保持兼容（批次/谱系响应仅**新增** `is_cancelled` 字段，未撤销
-> 数据行为不变）。
+> 注：新表 `batch_splits`、`batch_reviews` 与 `productions` 表的撤销字段
+> （`is_cancelled` / `cancel_reason` / `cancelled_at`）随启动/入口的
+> `CREATE TABLE IF NOT EXISTS` 与幂等 `ALTER TABLE ... ADD COLUMN` 自动
+> 创建/补齐，既有数据库升级无需手工迁移；现有登记、生产、污染标记、复核、
+> 批次/谱系查询、撤销接口的请求、响应字段与启动方式均保持兼容——
+> 谱系响应的 `edges` 仅**新增** `kind` 字段（既有投料边为 `"PRODUCTION"`），
+> 批次/谱系响应仍**新增** `is_cancelled` 字段，未撤销/未分装数据行为不变。

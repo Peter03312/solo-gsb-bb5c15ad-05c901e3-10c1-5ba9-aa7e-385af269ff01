@@ -22,6 +22,8 @@ from .schemas import (
     RawBatchIn,
     ReviewIn,
     ReviewOut,
+    SplitIn,
+    SplitOut,
     SuspectIn,
 )
 
@@ -162,6 +164,48 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)
 def get_lineage(batch_no: str, session: SessionDep) -> dict[str, Any]:
     return service.lineage(session, batch_no)
+
+
+@router.post(
+    "/batches/{batch_no}/splits",
+    response_model=SplitOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def split_batch(
+    batch_no: str,
+    body: SplitIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """按父批次编号分装：提交多个互异新编号与正数分装量。
+
+    返回父批次新余量、子批次清单与分装关系；任一校验不符整笔拒绝、不改库存。
+    分装不产生生产单，子批次继承单位并可作为正常生产来源。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.split_batch(session, batch_no, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
 
 
 @router.post("/contamination", response_model=DescendantsOut, status_code=status.HTTP_200_OK)

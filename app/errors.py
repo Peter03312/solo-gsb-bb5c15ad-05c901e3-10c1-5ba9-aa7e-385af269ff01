@@ -99,6 +99,25 @@ def batch_cancelled(batch_no: str) -> AppError:
     )
 
 
+def duplicate_split_target(batch_no: str) -> AppError:
+    return AppError(
+        "DUPLICATE_SPLIT_TARGET",
+        f"同一笔分装中新编号 {batch_no!r} 重复出现，各子批次编号必须互异",
+        422,
+        details={"batch_no": batch_no},
+    )
+
+
+def output_already_split(batch_no: str, child_nos: list[str]) -> AppError:
+    return AppError(
+        "OUTPUT_ALREADY_SPLIT",
+        f"产出批次 {batch_no!r} 已被分装为子批次（{', '.join(sorted(child_nos))}），"
+        "父批次分装后视为曾被使用，不可再撤销其生产单",
+        409,
+        details={"batch_no": batch_no, "split_into": sorted(child_nos)},
+    )
+
+
 def insufficient(batch_no: str, requested: object, remaining: object) -> AppError:
     return AppError(
         "INSUFFICIENT_BALANCE",

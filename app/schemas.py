@@ -55,6 +55,19 @@ class SuspectIn(BaseModel):
     note: str | None = Field(default=None, max_length=255)
 
 
+class SplitTargetIn(BaseModel):
+    """一笔分装：新子批次编号（全局不得复用）与正数分装量。"""
+
+    batch_no: BatchNo
+    quantity: PositiveQty
+
+
+class SplitIn(BaseModel):
+    """按父批次编号提交一笔分装：多个互异新编号 + 各自正数分装量。"""
+
+    splits: list[SplitTargetIn] = Field(min_length=1)
+
+
 class ReviewIn(BaseModel):
     batch_no: BatchNo
     review_note: str = Field(min_length=1, max_length=1000, examples=["复检合格：留样复测未检出农残"])
@@ -170,3 +183,31 @@ class ReviewOut(BaseModel):
     affected_batch_nos: list[str]
     released_batch_nos: list[str]
     still_quarantined: list[str]
+
+
+class SplitBatchOut(BaseModel):
+    """分装产生的子批次：编号、继承的单位与分装余量。"""
+
+    batch_no: str
+    unit: str
+    quantity: float
+    remaining_qty: float
+    is_suspect: bool
+    is_quarantined: bool
+
+
+class SplitRelationOut(BaseModel):
+    """分装关系：父批次 -> 子批次（分装量）。"""
+
+    parent_batch_no: str
+    child_batch_no: str
+    quantity: float
+
+
+class SplitOut(BaseModel):
+    """分装结果：父批次新余量、子批次清单与分装关系。"""
+
+    parent_batch_no: str
+    parent_remaining_qty: float
+    splits: list[SplitBatchOut]
+    relations: list[SplitRelationOut]

@@ -1,4 +1,4 @@
-"""ORM 模型：批次、生产单、投料明细、幂等记录。"""
+"""ORM 模型：批次、生产单、投料明细、分装关系、复核记录、幂等记录。"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -110,6 +110,37 @@ class ProductionInput(Base):
         UniqueConstraint("production_id", "source_no", name="uq_input_prod_source"),
         CheckConstraint("qty > 0", name="ck_production_input_qty_positive"),
         Index("ix_prod_input_source", "source_no"),
+    )
+
+
+class BatchSplit(Base):
+    """分装关系：父批次 -> 子批次（一条边对应一个子批次）。
+
+    分装只是把父批次的一部分余量拆成可独立投料的子批次：不产生生产单，
+    子批次是普通批次行（单位继承父批次）。分装边与投料边一起进入谱系
+    遍历与疑似隔离传播；父批次一旦分装即视为“曾被使用”。
+    """
+
+    __tablename__ = "batch_splits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    child_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False, unique=True
+    )
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    parent: Mapped[Batch] = relationship(foreign_keys=[parent_no])
+    child: Mapped[Batch] = relationship(foreign_keys=[child_no])
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_split_qty_positive"),
+        Index("ix_split_parent", "parent_no"),
     )
 
 

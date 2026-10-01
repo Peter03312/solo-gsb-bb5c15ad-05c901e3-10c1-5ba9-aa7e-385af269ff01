@@ -22,6 +22,8 @@ from .schemas import (
     RawBatchIn,
     ReviewIn,
     ReviewOut,
+    SplitIn,
+    SplitOut,
     SuspectIn,
 )
 
@@ -157,6 +159,63 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
         raise batch_not_found(batch_no)
     is_cancelled = service._is_cancelled_output(session, batch_no)
     return _batch_out(batch, is_cancelled)
+
+
+@router.post(
+    "/batches/{batch_no}/splits",
+    response_model=SplitOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_split(
+    batch_no: str,
+    body: SplitIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """分装：把父批次的一部分余量拆成若干可独立投料的子批次。
+
+    父批次须存在、未隔离且非已撤销产出；子批次继承父批次单位、不产生
+    生产单；任一校验不符整笔拒绝。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        result = service.split_batch(session, batch_no, body)
+        parent = result["parent"]
+        return status.HTTP_201_CREATED, {
+            "parent_batch_no": parent.batch_no,
+            "unit": parent.unit,
+            "parent_remaining_qty": float(parent.remaining_qty),
+            "total_split_qty": float(result["total_split_qty"]),
+            "children": [
+                {
+                    "batch_no": child.batch_no,
+                    "unit": child.unit,
+                    "quantity": float(child.remaining_qty),
+                }
+                for child in result["children"]
+            ],
+        }
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
 
 
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)

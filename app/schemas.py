@@ -79,6 +79,19 @@ class CancelIn(BaseModel):
         return value
 
 
+class SplitItemIn(BaseModel):
+    """一笔分装：子批次新编号 + 正数分装量。"""
+
+    batch_no: BatchNo
+    quantity: PositiveQty
+
+
+class SplitIn(BaseModel):
+    """分装请求：按父批次编号（路径）提交多个互异子批次新编号及分装量。"""
+
+    splits: list[SplitItemIn] = Field(min_length=1)
+
+
 # ---------- 响应 ----------
 
 
@@ -136,6 +149,24 @@ class ProductionRecordOut(BaseModel):
     is_cancelled: bool
     cancel_reason: str | None = None
     cancelled_at: str | None = None
+
+
+class SplitChildOut(BaseModel):
+    """分装得到的一个子批次。"""
+
+    batch_no: str
+    unit: str
+    quantity: float
+
+
+class SplitOut(BaseModel):
+    """分装结果：父批次新余量、子批次清单（即本次建立的分装关系）。"""
+
+    parent_batch_no: str
+    unit: str
+    parent_remaining_qty: float
+    total_split_qty: float
+    children: list[SplitChildOut]
 
 
 class NodeOut(BaseModel):

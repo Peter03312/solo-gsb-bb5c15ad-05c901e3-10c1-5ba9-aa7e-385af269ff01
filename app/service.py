@@ -13,12 +13,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
-from .models import Batch, BatchReview, IdempotencyKey, Production, ProductionInput
+from .models import (
+    Batch,
+    BatchReview,
+    BatchSplit,
+    IdempotencyKey,
+    Production,
+    ProductionInput,
+)
 from .schemas import (
     CancelIn,
     ProductionIn,
     RawBatchIn,
     ReviewIn,
+    SplitIn,
     SuspectIn,
 )
 
@@ -291,6 +299,77 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     ).scalar_one()
 
 
+# ---------------------------------------------------------------- 批次分装
+
+
+def split_batch(
+    session: Session, parent_no: str, data: SplitIn
+) -> dict[str, Any]:
+    """把父批次的一部分余量分装成若干可独立投料的子批次。
+
+    校验（任一不符整笔拒绝、不改变任何库存）：
+    1. 同一请求内子批次编号互不相同；
+    2. 父批次存在、非已撤销生产单产出、未隔离；
+    3. 子批次编号全局不得复用（与原料/产出批次共用编号空间）；
+    4. 各分装量为正数（入参校验），分装总量不超过父批次余量。
+
+    通过后在同一事务内：父批次余量按分装总量扣减；为每个子批次建立批次行
+    （单位继承父批次）与分装关系边。分装不产生生产单；子批次是普通批次，
+    可作为正常生产来源，也可再分装。父批次一旦分装即视为“曾被使用”，
+    若父批次是生产产出，原撤销入口将拒绝（即使子批次尚未投料）。
+
+    并发：与投料一致，对父批次加行锁（PG FOR UPDATE；SQLite 写事务串行），
+    并在 batches 表写入子批次行（与 QC 表锁互斥），使分装 / 投料 / 疑似标记 /
+    复核 / 撤销的任意并发都等价于某一串行顺序：不会超用父批次余量，
+    也不会出现“父批次已隔离却分装成功”或“分装后漏隔离”的结局。
+    """
+    child_nos = [item.batch_no for item in data.splits]
+    if len(set(child_nos)) != len(child_nos):
+        for no in child_nos:
+            if child_nos.count(no) > 1:
+                raise errors.duplicate_split_child(no)
+
+    # 锁父批次行：与并发投料/分装/撤销互斥，防止超用余量
+    parent = _lock_batch(session, parent_no)
+    if parent is None:
+        raise errors.batch_not_found(parent_no)
+    if _is_cancelled_output(session, parent_no):
+        raise errors.batch_cancelled(parent_no)
+    if parent.is_quarantined:
+        raise errors.batch_quarantined(parent_no)
+
+    for no in child_nos:
+        if session.get(Batch, no) is not None:
+            raise errors.batch_exists(no)
+
+    total = sum((item.quantity for item in data.splits), Decimal("0"))
+    if total > parent.remaining_qty:
+        raise errors.insufficient(parent_no, total, parent.remaining_qty)
+
+    parent.remaining_qty -= total
+
+    children: list[Batch] = []
+    for item in data.splits:
+        child = Batch(
+            batch_no=item.batch_no,
+            unit=parent.unit,  # 子批次继承父批次单位
+            initial_qty=item.quantity,
+            remaining_qty=item.quantity,
+        )
+        session.add(child)
+        try:
+            session.flush()  # 尽早暴露并发下的编号占用
+        except IntegrityError:
+            raise errors.batch_exists(item.batch_no) from None
+        session.add(
+            BatchSplit(parent_no=parent_no, child_no=item.batch_no, qty=item.quantity)
+        )
+        children.append(child)
+
+    session.flush()
+    return {"parent": parent, "children": children, "total_split_qty": total}
+
+
 # ---------------------------------------------------------------- 生产单撤销
 
 
@@ -329,7 +408,8 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     仅当产出同时满足以下全部条件时允许撤销，任一不符整笔拒绝、不改变库存：
     1. 产出编号存在且确为生产产出（原料批次不可撤销）；
     2. 该生产单尚未撤销（重复撤销明确拒绝）；
-    3. 产出从未被后续生产投料（严格按保留的投料记录判定，与下游是否已撤销无关）；
+    3. 产出从未被后续生产投料或分装（投料严格按保留的原始记录判定，与下游
+       是否已撤销无关；分装关系一旦建立即视为“曾被使用”，即使子批次尚未投料）；
     4. 产出当前非疑似（自身 is_suspect 为假；仅因疑似祖先被连带隔离不阻止撤销）；
     5. 产出无质检复核记录。
 
@@ -362,14 +442,21 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     if production.is_cancelled:
         raise errors.production_already_cancelled(output_no)
 
-    # 从未被后续生产投料：按保留的原始投料记录严格判定
-    # （下游单据即便已撤销，其投料行仍保留，因此这里不排除 is_cancelled）
+    # 从未被后续生产投料或分装：投料按保留的原始投料记录严格判定
+    # （下游单据即便已撤销，其投料行仍保留，因此这里不排除 is_cancelled）；
+    # 分装关系同样严格判定——产出只要分装过即视为“曾被使用”，
+    # 即使子批次尚未投料也不得撤销。
     consumer_rows = session.execute(
         select(Production.output_no)
         .join(ProductionInput, ProductionInput.production_id == Production.id)
         .where(ProductionInput.source_no == output_no)
     ).all()
-    consumer_nos = sorted({row[0] for row in consumer_rows})
+    split_rows = session.execute(
+        select(BatchSplit.child_no).where(BatchSplit.parent_no == output_no)
+    ).all()
+    consumer_nos = sorted(
+        {row[0] for row in consumer_rows} | {row[0] for row in split_rows}
+    )
     if consumer_nos:
         raise errors.output_already_consumed(output_no, consumer_nos)
 
@@ -434,14 +521,19 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
 
 # ---------------------------------------------------------------- 谱系与污染
 
-# 边方向：source -> output（原料指向产出）
-# 已撤销生产单的投料边不再进入有效谱系查询，也不参与疑似隔离传播：
-# 撤销后产出作废、来源投料已在同一事务返还，该笔单据视为从未发生。
+# 边方向：parent -> child（上游指向 downstream）
+# 有效谱系边 = 未撤销生产单的投料边 ∪ 分装边：
+# - 已撤销生产单的投料边不再进入有效谱系查询，也不参与疑似隔离传播：
+#   撤销后产出作废、来源投料已在同一事务返还，该笔单据视为从未发生；
+# - 分装边（父批次 -> 子批次）与投料边同等参与上下游遍历与隔离传播。
 _EDGE_CTE = """
 SELECT pi.source_no AS parent_no, p.output_no AS child_no
 FROM production_inputs pi
 JOIN productions p ON p.id = pi.production_id
 WHERE p.is_cancelled = FALSE
+UNION
+SELECT s.parent_no, s.child_no
+FROM batch_splits s
 """
 
 
@@ -560,7 +652,7 @@ def lineage(session: Session, batch_no: str) -> dict[str, Any]:
     ]
 
     involved = set(up_map) | set(down_map) | {batch_no}
-    edges = session.execute(
+    prod_edges = session.execute(
         select(ProductionInput.source_no, Production.output_no)
         .join(Production, Production.id == ProductionInput.production_id)
         .where(
@@ -570,6 +662,14 @@ def lineage(session: Session, batch_no: str) -> dict[str, Any]:
             Production.is_cancelled.is_(False),
         )
     ).all()
+    # 分装边与投料边一起进入谱系子图
+    split_edges = session.execute(
+        select(BatchSplit.parent_no, BatchSplit.child_no).where(
+            BatchSplit.parent_no.in_(involved),
+            BatchSplit.child_no.in_(involved),
+        )
+    ).all()
+    edges = sorted({(s, o) for s, o in prod_edges} | {(p, c) for p, c in split_edges})
     return {
         "batch_no": batch_no,
         "is_cancelled": _is_cancelled_output(session, batch_no),

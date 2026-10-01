@@ -65,8 +65,8 @@ def production_already_cancelled(batch_no: str) -> AppError:
 def output_already_consumed(batch_no: str, consumer_nos: list[str]) -> AppError:
     return AppError(
         "OUTPUT_ALREADY_CONSUMED",
-        f"产出批次 {batch_no!r} 已被后续生产投料（{', '.join(consumer_nos)}），"
-        "仅允许撤销从未被后续生产投料的产出",
+        f"产出批次 {batch_no!r} 已被后续生产投料或分装（{', '.join(consumer_nos)}），"
+        "仅允许撤销从未被后续生产投料或分装的产出",
         409,
         details={"batch_no": batch_no, "consumed_by": sorted(consumer_nos)},
     )
@@ -93,8 +93,17 @@ def production_has_review(batch_no: str) -> AppError:
 def batch_cancelled(batch_no: str) -> AppError:
     return AppError(
         "BATCH_CANCELLED",
-        f"批次 {batch_no!r} 为已撤销生产单的产出，已撤销产出不得再投料",
+        f"批次 {batch_no!r} 为已撤销生产单的产出，已撤销产出不得再投料或分装",
         409,
+        details={"batch_no": batch_no},
+    )
+
+
+def duplicate_split_child(batch_no: str) -> AppError:
+    return AppError(
+        "DUPLICATE_SPLIT_CHILD",
+        f"同一分装请求中子批次编号 {batch_no!r} 重复，子批次编号必须互异",
+        422,
         details={"batch_no": batch_no},
     )
 
